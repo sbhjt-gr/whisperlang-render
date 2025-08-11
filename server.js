@@ -3,6 +3,7 @@ const http = require('http');
 const socketIo = require('socket.io');
 const cors = require('cors');
 const { PeerServer } = require('peer');
+const { v4: uuidv4 } = require('uuid');
 
 const app = express();
 const server = http.createServer(app);
@@ -21,15 +22,15 @@ const io = socketIo(server, {
   }
 });
 
-const peerServer = PeerServer({
-  port: 9000,
-  path: '/peerjs',
-  proxied: true,
-  allow_discovery: true,
-});
+const PORT = process.env.PORT || 3000;
 
 let users = {};
 let rooms = {};
+
+// Helper function to generate meeting ID
+function generateMeetingId() {
+  return Math.random().toString(36).substring(2, 8).toUpperCase();
+}
 
 io.on('connection', (socket) => {
   console.log('User connected:', socket.id);
@@ -39,7 +40,8 @@ io.on('connection', (socket) => {
     users[socket.id] = {
       id: socket.id,
       username: username,
-      peerId: null
+      peerId: null,
+      roomId: null
     };
     
     socket.broadcast.emit('users-change', Object.values(users));
@@ -56,6 +58,132 @@ io.on('connection', (socket) => {
     }
   });
 
+  // Create a new meeting room
+  socket.on('create-meeting', (callback) => {
+    const meetingId = generateMeetingId();
+    const user = users[socket.id];
+    
+    if (user) {
+      rooms[meetingId] = {
+        id: meetingId,
+        host: user,
+        participants: [user],
+        created: new Date(),
+        active: true
+      };
+      
+      user.roomId = meetingId;
+      socket.join(meetingId);
+      
+      console.log(`Meeting created: ${meetingId} by ${user.username}`);
+      callback({ success: true, meetingId: meetingId });
+    } else {
+      callback({ success: false, error: 'User not registered' });
+    }
+  });
+
+  // Join an existing meeting room
+  socket.on('join-meeting', (meetingId, callback) => {
+    const user = users[socket.id];
+    const room = rooms[meetingId];
+    
+    if (!user) {
+      callback({ success: false, error: 'User not registered' });
+      return;
+    }
+    
+    if (!room) {
+      callback({ success: false, error: 'Meeting not found' });
+      return;
+    }
+    
+    if (!room.active) {
+      callback({ success: false, error: 'Meeting has ended' });
+      return;
+    }
+    
+    // Add user to room
+    room.participants.push(user);
+    user.roomId = meetingId;
+    socket.join(meetingId);
+    
+    console.log(`${user.username} joined meeting: ${meetingId}`);
+    
+    // Notify existing participants
+    socket.to(meetingId).emit('user-joined', user);
+    
+    // Send current participants to new user
+    callback({ 
+      success: true, 
+      meetingId: meetingId,
+      participants: room.participants.filter(p => p.id !== socket.id)
+    });
+  });
+
+  // Leave meeting
+  socket.on('leave-meeting', () => {
+    const user = users[socket.id];
+    if (user && user.roomId) {
+      const room = rooms[user.roomId];
+      if (room) {
+        // Remove user from room
+        room.participants = room.participants.filter(p => p.id !== socket.id);
+        socket.to(user.roomId).emit('user-left', user);
+        socket.leave(user.roomId);
+        
+        // If host leaves or room is empty, end the meeting
+        if (room.participants.length === 0 || room.host.id === socket.id) {
+          room.active = false;
+          socket.to(user.roomId).emit('meeting-ended');
+          console.log(`Meeting ${user.roomId} ended`);
+        }
+        
+        user.roomId = null;
+      }
+    }
+  });
+
+  // WebRTC signaling for room-based calls
+  socket.on('offer', (data) => {
+    const { targetPeerId, offer, meetingId } = data;
+    const user = users[socket.id];
+    
+    if (user && user.roomId === meetingId) {
+      socket.to(meetingId).emit('offer', {
+        offer: offer,
+        fromPeerId: user.peerId,
+        fromUsername: user.username
+      });
+    }
+  });
+
+  socket.on('answer', (data) => {
+    const { targetPeerId, answer, meetingId } = data;
+    const user = users[socket.id];
+    
+    if (user && user.roomId === meetingId) {
+      socket.to(meetingId).emit('answer', {
+        answer: answer,
+        fromPeerId: user.peerId,
+        fromUsername: user.username
+      });
+    }
+  });
+
+  socket.on('ice-candidate', (data) => {
+    const { targetPeerId, candidate, meetingId } = data;
+    const user = users[socket.id];
+    
+    if (user && user.roomId === meetingId) {
+      socket.to(meetingId).emit('ice-candidate', {
+        candidate: candidate,
+        fromPeerId: user.peerId,
+        fromUsername: user.username
+      });
+    }
+  });
+
+  // Legacy call handling (for backward compatibility)
   socket.on('call', (targetUsername) => {
     console.log('Call initiated to:', targetUsername);
     const caller = users[socket.id];
@@ -105,6 +233,23 @@ io.on('connection', (socket) => {
 
   socket.on('disconnect', () => {
     console.log('User disconnected:', socket.id);
+    const user = users[socket.id];
+    
+    // Leave meeting if in one
+    if (user && user.roomId) {
+      const room = rooms[user.roomId];
+      if (room) {
+        room.participants = room.participants.filter(p => p.id !== socket.id);
+        socket.to(user.roomId).emit('user-left', user);
+        
+        // End meeting if host disconnects or room is empty
+        if (room.participants.length === 0 || room.host.id === socket.id) {
+          room.active = false;
+          socket.to(user.roomId).emit('meeting-ended');
+        }
+      }
+    }
+    
     delete users[socket.id];
     socket.broadcast.emit('users-change', Object.values(users));
   });
@@ -115,6 +260,7 @@ app.get('/', (req, res) => {
     message: 'WhisperLang WebRTC Signaling Server',
     status: 'Running',
     users: Object.keys(users).length,
+    rooms: Object.keys(rooms).length,
     timestamp: new Date().toISOString()
   });
 });
@@ -123,14 +269,29 @@ app.get('/health', (req, res) => {
   res.json({
     status: 'healthy',
     users: Object.keys(users).length,
+    rooms: Object.keys(rooms).length,
     uptime: process.uptime()
   });
 });
 
-const PORT = process.env.PORT || 3000;
-const PEER_PORT = process.env.PEER_PORT || 9000;
+// API endpoint to get meeting info
+app.get('/meeting/:id', (req, res) => {
+  const meetingId = req.params.id;
+  const room = rooms[meetingId];
+  
+  if (!room) {
+    return res.status(404).json({ error: 'Meeting not found' });
+  }
+  
+  res.json({
+    id: room.id,
+    active: room.active,
+    participantCount: room.participants.length,
+    created: room.created
+  });
+});
 
 server.listen(PORT, () => {
   console.log(`Signaling server running on port ${PORT}`);
-  console.log(`PeerJS server running on port ${PEER_PORT}`);
+  console.log(`WebRTC signaling server ready`);
 });
