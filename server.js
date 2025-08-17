@@ -18,8 +18,12 @@ app.use(express.json());
 const io = socketIo(server, {
   cors: {
     origin: "*",
-    methods: ["GET", "POST"]
-  }
+    methods: ["GET", "POST"],
+    allowedHeaders: ["*"],
+    credentials: false
+  },
+  allowEIO3: true,
+  transports: ['websocket', 'polling']
 });
 
 const PORT = process.env.PORT || 3000;
